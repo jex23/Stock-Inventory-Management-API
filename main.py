@@ -529,8 +529,7 @@ class StockStatsResponse(BaseModel):
     used_stocks: int
     finished_products: int
     raw_materials: int
-    total_product_quantity: Decimal = Decimal('0.00')  # ADD THIS LINE
-
+    total_product_quantity: Decimal = Decimal('0.00')
 
 # Add batch-related utility functions
 def generate_batch_number(db: Session) -> str:
@@ -564,7 +563,45 @@ def generate_batch_number(db: Session) -> str:
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         return f"batch-{timestamp}"
 
+def generate_process_batch_number(db: Session) -> str:
+    """Generate next process batch number in format process-XXXXXX"""
+    try:
+        # Get the latest process batch number from database
+        latest_process = db.query(ProcessManagement)\
+            .filter(ProcessManagement.process_id_batch.isnot(None))\
+            .order_by(ProcessManagement.manufactured_date.desc())\
+            .first()
+        
+        if not latest_process or not latest_process.process_id_batch:
+            # If no processes exist or no batch number, start with process-000001
+            return "process-000001"
+        
+        # Extract number from latest batch (e.g., "process-000045" -> 45)
+        latest_batch = latest_process.process_id_batch
+        if latest_batch.startswith("process-"):
+            try:
+                batch_num = int(latest_batch.split("-")[1])
+                next_num = batch_num + 1
+                return f"process-{next_num:06d}"
+            except (IndexError, ValueError):
+                # If batch format is unexpected, start from 000001
+                return "process-000001"
+        else:
+            # If latest batch doesn't follow our format, start from 000001
+            return "process-000001"
+            
+    except Exception as e:
+        print(f"⚠️ Error generating process batch number: {e}")
+        # Fallback to timestamp-based batch number
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        return f"process-{timestamp}"
 
+def get_process_batch_items(db: Session, process_batch_number: str) -> List[ProcessManagement]:
+    """Get all process management items for a specific batch"""
+    return db.query(ProcessManagement)\
+        .filter(ProcessManagement.process_id_batch == process_batch_number)\
+        .all()
 
 def get_batch_stocks(db: Session, batch_number: str) -> List[Stock]:
     """Get all stocks for a specific batch"""
@@ -574,7 +611,10 @@ def get_all_batches(db: Session) -> List[Dict[str, Any]]:
     """Get all unique batches with summary information"""
     try:
         # Get all unique batch numbers with their creation dates
-        batches_query = db.query(Stock.batch, func.min(Stock.created_at).label('created_at')).group_by(Stock.batch).order_by(func.min(Stock.created_at).desc()).all()
+        batches_query = db.query(Stock.batch, func.min(Stock.created_at).label('created_at'))\
+            .group_by(Stock.batch)\
+            .order_by(func.min(Stock.created_at).desc())\
+            .all()
         
         batches = []
         for batch_number, created_at in batches_query:
@@ -584,7 +624,14 @@ def get_all_batches(db: Session) -> List[Dict[str, Any]]:
             if batch_stocks:
                 # Calculate summary statistics
                 total_items = len(batch_stocks)
-                total_quantity = sum(stock.quantity for stock in batch_stocks)
+                
+                # FIXED: Calculate total product quantity from related products
+                total_product_quantity = Decimal('0.00')
+                for stock in batch_stocks:
+                    product = db.query(Product).filter(Product.id == stock.product_id).first()
+                    if product:
+                        # Multiply product quantity by piece count
+                        total_product_quantity += product.quantity * stock.piece
                 
                 # Count by category
                 categories = {}
@@ -600,7 +647,7 @@ def get_all_batches(db: Session) -> List[Dict[str, Any]]:
                 batches.append({
                     "batch_number": batch_number,
                     "total_items": total_items,
-                    "total_quantity": total_quantity,
+                    "total_product_quantity": total_product_quantity,  # FIXED
                     "categories": categories,
                     "created_at": created_at,
                     "user_name": user_name
@@ -611,7 +658,6 @@ def get_all_batches(db: Session) -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"⚠️ Error getting batches: {e}")
         return []
-
 
 # Utility Functions
 def hash_password(password: str) -> str:
@@ -3043,115 +3089,6 @@ async def mark_stock_used(
     
     status_text = "marked as used" if stock.used == 1 else "marked as unused"
     return {"message": f"Stock item has been {status_text} successfully"}
-
-@app.get("/stocks/stats", response_model=StockStatsResponse)
-async def get_stock_stats(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get stock statistics. Available to all authenticated users."""
-    print("📊 Starting get_stock_stats function")
-    try:
-        # First check if the Stock table exists and has any data
-        print("🔍 Checking if Stock table has any data...")
-        
-        try:
-            # Quick check to see if table exists and has data
-            table_exists_check = db.execute(text("SELECT COUNT(*) FROM stock")).scalar()
-            print(f"✅ Table exists. Row count: {table_exists_check}")
-            
-            if table_exists_check == 0:
-                print("📝 Stock table is empty - returning default zero values")
-                return StockStatsResponse(
-                    total_stocks=0,
-                    active_stocks=0,
-                    archived_stocks=0,
-                    used_stocks=0,
-                    finished_products=0,
-                    raw_materials=0,
-                    total_product_quantity=Decimal('0.00')  # ADDED
-                )
-                
-        except Exception as table_error:
-            print(f"⚠️ Table check failed (table might not exist): {table_error}")
-            print("📝 Returning default zero values due to table access issue")
-            return StockStatsResponse(
-                total_stocks=0,
-                active_stocks=0,
-                archived_stocks=0,
-                used_stocks=0,
-                finished_products=0,
-                raw_materials=0,
-                total_product_quantity=Decimal('0.00')  # ADDED
-            )
-        
-        print("🔍 Table has data, proceeding with detailed queries...")
-        
-        # Get basic counts
-        total_stocks = db.query(Stock).count() or 0
-        print(f"✅ Total stocks: {total_stocks}")
-        
-        archived_stocks = db.query(Stock).filter(Stock.archive == 1).count() or 0
-        print(f"✅ Archived stocks: {archived_stocks}")
-        
-        used_stocks = db.query(Stock).filter(Stock.used == 1).count() or 0
-        print(f"✅ Used stocks: {used_stocks}")
-        
-        active_stocks = max(0, total_stocks - archived_stocks)
-        print(f"✅ Active stocks: {active_stocks}")
-        
-        # Get category counts with error handling
-        try:
-            finished_products = db.query(Stock).filter(Stock.category == StockCategory.finished_product).count() or 0
-            print(f"✅ Finished products: {finished_products}")
-        except Exception as e:
-            print(f"⚠️ Error getting finished products count: {e}")
-            finished_products = 0
-            
-        try:
-            raw_materials = db.query(Stock).filter(Stock.category == StockCategory.raw_material).count() or 0
-            print(f"✅ Raw materials: {raw_materials}")
-        except Exception as e:
-            print(f"⚠️ Error getting raw materials count: {e}")
-            raw_materials = 0
-        
-        # ADDED: Calculate total product quantity from Product table
-        try:
-            total_product_quantity = db.query(func.sum(Product.quantity)).scalar() or Decimal('0.00')
-            print(f"✅ Total product quantity: {total_product_quantity}")
-        except Exception as e:
-            print(f"⚠️ Error getting total product quantity: {e}")
-            total_product_quantity = Decimal('0.00')
-        
-        response_data = StockStatsResponse(
-            total_stocks=total_stocks,
-            active_stocks=active_stocks,
-            archived_stocks=archived_stocks,
-            used_stocks=used_stocks,
-            finished_products=finished_products,
-            raw_materials=raw_materials,
-            total_product_quantity=total_product_quantity  # ADDED
-        )
-        
-        print(f"📋 Final response: {response_data.dict()}")
-        return response_data
-        
-    except Exception as e:
-        print(f"❌ MAJOR ERROR in get_stock_stats: {e}")
-        print(f"❌ Error type: {type(e)}")
-        import traceback
-        print(f"❌ Full traceback: {traceback.format_exc()}")
-        
-        print("🔄 Returning safe default values due to error...")
-        return StockStatsResponse(
-            total_stocks=0,
-            active_stocks=0,
-            archived_stocks=0,
-            used_stocks=0,
-            finished_products=0,
-            raw_materials=0,
-            total_product_quantity=Decimal('0.00')  # ADDED
-        )
 
 @app.get("/")
 async def root():
