@@ -156,15 +156,17 @@ class ProcessManagement(Base):
     process_id_batch = Column(String(50), nullable=True)
     stock_id = Column(Integer, ForeignKey('stock.id'), nullable=False)
     users_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    finished_product_id = Column(Integer, ForeignKey('product.id'), nullable=False)
+    finished_product_id = Column(Integer, ForeignKey('finished_product_category.id'), nullable=False)  # Fixed FK
+    pieces_used = Column(Integer, nullable=False, default=100)  # NEW: Track pieces consumed
     archive = Column(Integer, default=0)
     manufactured_date = Column(TIMESTAMP, default=func.current_timestamp())
     updated_at = Column(TIMESTAMP, default=func.current_timestamp(), onupdate=func.current_timestamp())
     
-    # Relationships
+    # Relationships (Updated)
     stock = relationship("Stock", foreign_keys=[stock_id])
     user = relationship("User", foreign_keys=[users_id])
-    finished_product = relationship("Product", foreign_keys=[finished_product_id])
+    finished_product_category = relationship("FinishedProductCategory", foreign_keys=[finished_product_id])  # Fixed
+
 
 # Database Models
 class User(Base):
@@ -435,11 +437,13 @@ class ProcessManagementCreate(BaseModel):
     stock_id: int
     users_id: int
     finished_product_id: int
+    pieces_used: int = 100 
 
 class ProcessManagementUpdate(BaseModel):
     stock_id: Optional[int] = None
     users_id: Optional[int] = None
     finished_product_id: Optional[int] = None
+    pieces_used: Optional[int] = None  
     archive: Optional[bool] = None
 
 class ProcessManagementResponse(BaseModel):
@@ -448,6 +452,7 @@ class ProcessManagementResponse(BaseModel):
     stock_id: int
     users_id: int
     finished_product_id: int
+    pieces_used: int  # NEW: Include in response
     archive: bool
     manufactured_date: datetime
     updated_at: datetime
@@ -456,6 +461,8 @@ class ProcessManagementResponse(BaseModel):
     stock_batch: Optional[str] = None
     user_name: Optional[str] = None
     finished_product_name: Optional[str] = None
+    stock_original_pieces: Optional[int] = None  # NEW: For consolidation info
+    stock_remaining_pieces: Optional[int] = None  # NEW: After processing
     
     class Config:
         from_attributes = True
@@ -463,10 +470,11 @@ class ProcessManagementResponse(BaseModel):
 class BatchProcessItem(BaseModel):
     stock_id: int
     finished_product_id: int
+    pieces_to_use: int  # NEW: Required field for smart consolidation
 
 class BatchProcessCreate(BaseModel):
     items: List[BatchProcessItem]
-    users_id: Optional[int] = None  # Will be auto-populated from current user
+    users_id: Optional[int] = None
 
 class ProcessBatchResponse(BaseModel):
     process_batch_number: str
@@ -491,6 +499,28 @@ class ProcessBatchSummaryResponse(BaseModel):
 
 class ProcessBatchArchiveRequest(BaseModel):
     archive: bool
+
+class StockGroupInfo(BaseModel):
+    product_id: int
+    supplier_id: int
+    category: str
+    product_name: str
+    supplier_name: str
+    stocks: List[dict]
+    total_available_pieces: int
+
+class ConsolidationSuggestion(BaseModel):
+    can_fulfill: bool
+    total_available: int
+    required_stocks: int
+    stock_allocations: List[dict]
+    shortage: int = 0
+
+class SmartAllocationRequest(BaseModel):
+    product_id: int
+    supplier_id: int
+    category: StockCategory
+    requested_pieces: int
 
 # Update forward references
 ProcessBatchResponse.update_forward_refs()
@@ -2370,74 +2400,142 @@ async def create_process_batch(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Create multiple process management items in a single batch. Available to all authenticated users."""
+    """Create process batch with smart consolidation support."""
     try:
         print(f"📦 Creating process batch with {len(batch_data.items)} items...")
         
         if not batch_data.items:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="At least one item is required for batch creation"
-            )
+            raise HTTPException(status_code=400, detail="At least one item is required")
         
-        # Use current user if users_id not provided
         users_id = batch_data.users_id if batch_data.users_id is not None else current_user.id
-        
-        # Generate process batch number
         process_batch_number = generate_process_batch_number(db)
-        print(f"📝 Generated process batch number: {process_batch_number}")
         
-        # Validate all items first
+        # Enhanced validation with piece checking
+        validated_items = []
+        stock_usage_tracker = {}  # Track total usage per stock across all items
+        
         for i, item in enumerate(batch_data.items):
-            # Validate foreign keys
+            # Validate stock exists
             stock = db.query(Stock).filter(Stock.id == item.stock_id).first()
             if not stock:
+                raise HTTPException(status_code=400, detail=f"Item {i+1}: Stock not found (ID: {item.stock_id})")
+            
+            # Track cumulative usage of this stock
+            if item.stock_id in stock_usage_tracker:
+                stock_usage_tracker[item.stock_id] += item.pieces_to_use
+            else:
+                stock_usage_tracker[item.stock_id] = item.pieces_to_use
+            
+            # Check if cumulative usage exceeds stock capacity
+            if stock_usage_tracker[item.stock_id] > stock.piece:
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Item {i+1}: Stock not found (ID: {item.stock_id})"
+                    status_code=400,
+                    detail=f"Total usage of stock '{stock.batch}' ({stock_usage_tracker[item.stock_id]} pieces) "
+                          f"exceeds available pieces ({stock.piece})"
                 )
             
-            finished_product = db.query(Product).filter(Product.id == item.finished_product_id).first()
-            if not finished_product:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Item {i+1}: Finished product not found (ID: {item.finished_product_id})"
-                )
+            # Validate pieces
+            if item.pieces_to_use <= 0:
+                raise HTTPException(status_code=400, detail=f"Item {i+1}: Pieces must be greater than 0")
+            
+            # Check stock availability
+            if stock.used or stock.archive:
+                raise HTTPException(status_code=400, detail=f"Item {i+1}: Stock '{stock.batch}' is not available")
+            
+            # Validate finished product category
+            finished_product_category = db.query(FinishedProductCategory).filter(
+                FinishedProductCategory.id == item.finished_product_id
+            ).first()
+            if not finished_product_category:
+                raise HTTPException(status_code=400, detail=f"Item {i+1}: Finished product category not found")
+            
+            validated_items.append({
+                'item': item,
+                'stock': stock,
+                'category': finished_product_category
+            })
         
         # Validate user
         user = db.query(User).filter(User.id == users_id).first()
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="User not found"
-            )
+            raise HTTPException(status_code=400, detail="User not found")
         
-        # Create all process management items
+        # Create process management records and update stocks
         created_processes = []
-        for item in batch_data.items:
+        
+        for validated_item in validated_items:
+            item = validated_item['item']
+            stock = validated_item['stock']
+            category = validated_item['category']
+            
+            # Store original pieces for response
+            original_pieces = stock.piece
+            
+            # Create process management record
             db_process = ProcessManagement(
                 process_id_batch=process_batch_number,
                 stock_id=item.stock_id,
                 users_id=users_id,
-                finished_product_id=item.finished_product_id
+                finished_product_id=item.finished_product_id,
+                pieces_used=item.pieces_to_use  # NEW: Track pieces consumed
             )
             db.add(db_process)
-            created_processes.append(db_process)
+            created_processes.append({
+                'process': db_process,
+                'stock': stock,
+                'category': category,
+                'pieces_used': item.pieces_to_use,
+                'original_pieces': original_pieces
+            })
         
-        # Commit all at once
+        # Update stock pieces (after all validations pass)
+        stock_updates = {}
+        for process_data in created_processes:
+            stock = process_data['stock']
+            pieces_used = process_data['pieces_used']
+            
+            if stock.id not in stock_updates:
+                stock_updates[stock.id] = {
+                    'stock': stock,
+                    'original_pieces': stock.piece,
+                    'total_used': 0
+                }
+            
+            stock_updates[stock.id]['total_used'] += pieces_used
+        
+        # Apply stock updates
+        for stock_id, update_info in stock_updates.items():
+            stock = update_info['stock']
+            total_used = update_info['total_used']
+            original_pieces = update_info['original_pieces']
+            
+            remaining_pieces = original_pieces - total_used
+            stock.piece = remaining_pieces
+            
+            # Mark as used if fully depleted
+            if remaining_pieces <= 0:
+                stock.used = 1
+            
+            print(f"📦 Stock {stock.batch}: {original_pieces} → {remaining_pieces} pieces (used: {total_used})")
+        
+        # Commit all changes
         db.commit()
         
         # Refresh all processes to get IDs
-        for process in created_processes:
-            db.refresh(process)
+        for process_data in created_processes:
+            db.refresh(process_data['process'])
         
         print(f"✅ Created {len(created_processes)} process items in batch {process_batch_number}")
         
-        # Prepare response with related data
+        # Prepare enhanced response
         process_responses = []
-        for process in created_processes:
-            stock = db.query(Stock).filter(Stock.id == process.stock_id).first()
-            finished_product = db.query(Product).filter(Product.id == process.finished_product_id).first()
+        for process_data in created_processes:
+            process = process_data['process']
+            stock = process_data['stock']
+            category = process_data['category']
+            
+            # Refresh stock to get updated piece count
+            db.refresh(stock)
             
             process_dict = {
                 "id": process.id,
@@ -2445,12 +2543,15 @@ async def create_process_batch(
                 "stock_id": process.stock_id,
                 "users_id": process.users_id,
                 "finished_product_id": process.finished_product_id,
+                "pieces_used": process.pieces_used,  # NEW
                 "archive": bool(process.archive),
                 "manufactured_date": process.manufactured_date,
                 "updated_at": process.updated_at,
-                "stock_batch": stock.batch if stock else None,
-                "finished_product_name": finished_product.name if finished_product else None,
-                "user_name": f"{user.first_name} {user.last_name}"
+                "stock_batch": stock.batch,
+                "finished_product_name": category.name,  # Fixed
+                "user_name": f"{user.first_name} {user.last_name}",
+                "stock_original_pieces": process_data['original_pieces'],  # NEW
+                "stock_remaining_pieces": stock.piece  # NEW
             }
             process_responses.append(ProcessManagementResponse(**process_dict))
         
@@ -2464,11 +2565,9 @@ async def create_process_batch(
         raise
     except Exception as e:
         print(f"❌ Error creating process batch: {e}")
-        db.rollback()  # Rollback on error
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error creating process batch"
-        )
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Error creating process batch")
+
 
 @app.delete("/process-management/batches/{process_batch_number}")
 async def delete_process_batch(
@@ -2611,30 +2710,27 @@ async def get_all_process_management(
     current_user: User = Depends(get_current_user),
     archive: Optional[bool] = None
 ):
-    """Get all process management items with optional filtering. Available to all authenticated users."""
+    """Get all process management items with enhanced data."""
     try:
-        print(f"🔍 Getting process management items with filters - archive: {archive}")
-        
         query = db.query(ProcessManagement)
         
-        # Apply filters
         if archive is not None:
             query = query.filter(ProcessManagement.archive == (1 if archive else 0))
-            print(f"🔍 Applied archive filter: {archive}")
         
         processes = query.all()
-        print(f"📋 Found {len(processes)} process management items after filtering")
         
         if not processes:
             return []
         
-        # Enhance with related data
+        # Enhanced response with piece information
         process_responses = []
         for process in processes:
             try:
-                # Get related data safely
+                # Get related data
                 stock = db.query(Stock).filter(Stock.id == process.stock_id).first()
-                finished_product = db.query(Product).filter(Product.id == process.finished_product_id).first()
+                finished_product_category = db.query(FinishedProductCategory).filter(
+                    FinishedProductCategory.id == process.finished_product_id
+                ).first()  # Fixed
                 user = db.query(User).filter(User.id == process.users_id).first()
                 
                 process_dict = {
@@ -2643,20 +2739,22 @@ async def get_all_process_management(
                     "stock_id": process.stock_id,
                     "users_id": process.users_id,
                     "finished_product_id": process.finished_product_id,
+                    "pieces_used": process.pieces_used,  # NEW
                     "archive": bool(process.archive),
                     "manufactured_date": process.manufactured_date,
                     "updated_at": process.updated_at,
                     "stock_batch": stock.batch if stock else f"Stock {process.stock_id} (Not Found)",
-                    "finished_product_name": finished_product.name if finished_product else f"Product {process.finished_product_id} (Not Found)",
-                    "user_name": f"{user.first_name} {user.last_name}" if user else f"User {process.users_id} (Not Found)"
+                    "finished_product_name": finished_product_category.name if finished_product_category else f"Category {process.finished_product_id} (Not Found)",  # Fixed
+                    "user_name": f"{user.first_name} {user.last_name}" if user else f"User {process.users_id} (Not Found)",
+                    "stock_original_pieces": None,  # Would need historical data
+                    "stock_remaining_pieces": stock.piece if stock else None  # Current remaining
                 }
                 process_responses.append(ProcessManagementResponse(**process_dict))
                 
             except Exception as e:
-                print(f"⚠️ Error processing process management item {process.id}: {e}")
+                print(f"⚠️ Error processing item {process.id}: {e}")
                 continue
         
-        print(f"✅ Successfully processed {len(process_responses)} process management items")
         return process_responses
         
     except Exception as e:
@@ -2669,54 +2767,75 @@ async def create_process_management(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Create a new process management item. Available to all authenticated users."""
+    """Create a new process management item with piece tracking."""
     
-    # Validate foreign keys
+    # Validate stock and pieces
     stock = db.query(Stock).filter(Stock.id == process_data.stock_id).first()
     if not stock:
+        raise HTTPException(status_code=400, detail="Stock not found")
+    
+    # NEW: Validate pieces
+    if process_data.pieces_used <= 0:
+        raise HTTPException(status_code=400, detail="Pieces used must be greater than 0")
+    
+    if process_data.pieces_used > stock.piece:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Stock not found"
+            status_code=400, 
+            detail=f"Cannot use {process_data.pieces_used} pieces. Stock only has {stock.piece} pieces available"
         )
     
-    finished_product = db.query(Product).filter(Product.id == process_data.finished_product_id).first()
-    if not finished_product:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Finished product not found"
-        )
+    if stock.used or stock.archive:
+        raise HTTPException(status_code=400, detail="Stock is not available")
     
+    # Validate finished product category (Fixed)
+    finished_product_category = db.query(FinishedProductCategory).filter(
+        FinishedProductCategory.id == process_data.finished_product_id
+    ).first()
+    if not finished_product_category:
+        raise HTTPException(status_code=400, detail="Finished product category not found")
+    
+    # Validate user
     user = db.query(User).filter(User.id == process_data.users_id).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User not found"
-        )
+        raise HTTPException(status_code=400, detail="User not found")
     
-    # Create process management item without batch (single item)
+    # Store original pieces for response
+    original_pieces = stock.piece
+    
+    # Create process management record
     db_process = ProcessManagement(
         stock_id=process_data.stock_id,
         users_id=process_data.users_id,
-        finished_product_id=process_data.finished_product_id
-        # process_id_batch will be None for individual items
+        finished_product_id=process_data.finished_product_id,
+        pieces_used=process_data.pieces_used  # NEW: Track pieces
     )
     db.add(db_process)
+    
+    # NEW: Update stock pieces
+    stock.piece = stock.piece - process_data.pieces_used
+    if stock.piece <= 0:
+        stock.used = 1  # Mark as used if fully depleted
+    
     db.commit()
     db.refresh(db_process)
+    db.refresh(stock)
     
-    # Return with related data
+    # Enhanced response with piece information
     process_dict = {
         "id": db_process.id,
         "process_id_batch": db_process.process_id_batch,
         "stock_id": db_process.stock_id,
         "users_id": db_process.users_id,
         "finished_product_id": db_process.finished_product_id,
+        "pieces_used": db_process.pieces_used,  # NEW
         "archive": bool(db_process.archive),
         "manufactured_date": db_process.manufactured_date,
         "updated_at": db_process.updated_at,
         "stock_batch": stock.batch,
-        "finished_product_name": finished_product.name,
-        "user_name": f"{user.first_name} {user.last_name}"
+        "finished_product_name": finished_product_category.name,  # Fixed
+        "user_name": f"{user.first_name} {user.last_name}",
+        "stock_original_pieces": original_pieces,  # NEW
+        "stock_remaining_pieces": stock.piece  # NEW
     }
     
     return ProcessManagementResponse(**process_dict)
@@ -3089,6 +3208,128 @@ async def mark_stock_used(
     
     status_text = "marked as used" if stock.used == 1 else "marked as unused"
     return {"message": f"Stock item has been {status_text} successfully"}
+
+@app.get("/stocks/groups")
+async def get_stock_groups(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    min_pieces: Optional[int] = 1
+):
+    """Get stocks grouped by product, supplier, and category for consolidation."""
+    try:
+        # Get available stocks
+        stocks = db.query(Stock).filter(
+            Stock.archive == 0,
+            Stock.used == 0,
+            Stock.piece >= min_pieces
+        ).all()
+        
+        # Group stocks by product + supplier + category
+        groups = {}
+        
+        for stock in stocks:
+            # Get related data
+            product = db.query(Product).filter(Product.id == stock.product_id).first()
+            supplier = db.query(Supplier).filter(Supplier.id == stock.supplier_id).first()
+            
+            # Create group key
+            group_key = f"{stock.product_id}-{stock.supplier_id}-{stock.category.value}"
+            
+            if group_key not in groups:
+                groups[group_key] = {
+                    "product_id": stock.product_id,
+                    "supplier_id": stock.supplier_id,
+                    "category": stock.category.value,
+                    "product_name": product.name if product else f"Product {stock.product_id}",
+                    "supplier_name": supplier.name if supplier else f"Supplier {stock.supplier_id}",
+                    "stocks": [],
+                    "total_available_pieces": 0
+                }
+            
+            groups[group_key]["stocks"].append({
+                "id": stock.id,
+                "batch": stock.batch,
+                "pieces": stock.piece,
+                "created_at": stock.created_at.isoformat()
+            })
+            groups[group_key]["total_available_pieces"] += stock.piece
+        
+        # Convert to list and sort by total available pieces
+        group_list = list(groups.values())
+        group_list.sort(key=lambda x: x["total_available_pieces"], reverse=True)
+        
+        return {
+            "total_groups": len(group_list),
+            "groups": group_list
+        }
+        
+    except Exception as e:
+        print(f"❌ Error getting stock groups: {e}")
+        raise HTTPException(status_code=500, detail="Error retrieving stock groups")
+
+
+@app.post("/stocks/consolidation-suggestion")
+async def get_consolidation_suggestion(
+    request: SmartAllocationRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get smart allocation suggestion for requested pieces across similar stocks."""
+    try:
+        # Find all similar stocks (same product, supplier, category)
+        similar_stocks = db.query(Stock).filter(
+            and_(
+                Stock.product_id == request.product_id,
+                Stock.supplier_id == request.supplier_id,
+                Stock.category == request.category,
+                Stock.archive == 0,
+                Stock.used == 0,
+                Stock.piece > 0
+            )
+        ).order_by(Stock.piece.desc()).all()  # Order by pieces descending
+        
+        if not similar_stocks:
+            return ConsolidationSuggestion(
+                can_fulfill=False,
+                total_available=0,
+                required_stocks=0,
+                stock_allocations=[],
+                shortage=request.requested_pieces
+            )
+        
+        # Calculate smart allocation
+        allocations = []
+        remaining_need = request.requested_pieces
+        total_available = sum(stock.piece for stock in similar_stocks)
+        
+        for stock in similar_stocks:
+            if remaining_need <= 0:
+                break
+                
+            pieces_from_this_stock = min(remaining_need, stock.piece)
+            
+            if pieces_from_this_stock > 0:
+                allocations.append({
+                    "stock_id": stock.id,
+                    "stock_batch": stock.batch,
+                    "pieces_from_this_stock": pieces_from_this_stock,
+                    "stock_total_pieces": stock.piece,
+                    "stock_remaining_after": stock.piece - pieces_from_this_stock
+                })
+                
+                remaining_need -= pieces_from_this_stock
+        
+        return ConsolidationSuggestion(
+            can_fulfill=remaining_need == 0,
+            total_available=total_available,
+            required_stocks=len(allocations),
+            stock_allocations=allocations,
+            shortage=max(0, remaining_need)
+        )
+        
+    except Exception as e:
+        print(f"❌ Error getting consolidation suggestion: {e}")
+        raise HTTPException(status_code=500, detail="Error calculating consolidation suggestion")
 
 @app.get("/")
 async def root():
