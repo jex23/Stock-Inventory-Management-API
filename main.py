@@ -1824,7 +1824,14 @@ async def get_all_stock_batches(
             if batch_stocks:
                 # Calculate summary statistics
                 total_items = len(batch_stocks)
-                total_quantity = sum(stock.quantity for stock in batch_stocks)
+                
+                # FIXED: Calculate total product quantity from related products
+                total_product_quantity = Decimal('0.00')
+                for stock in batch_stocks:
+                    product = db.query(Product).filter(Product.id == stock.product_id).first()
+                    if product:
+                        # Multiply product quantity by piece count
+                        total_product_quantity += product.quantity * stock.piece
                 
                 # Count by category
                 categories = {}
@@ -1840,7 +1847,7 @@ async def get_all_stock_batches(
                 batch_data = BatchSummaryResponse(
                     batch_number=batch_number,
                     total_items=total_items,
-                    total_quantity=total_quantity,
+                    total_product_quantity=total_product_quantity,  # FIXED
                     categories=categories,
                     created_at=created_at,
                     user_name=user_name
@@ -1880,7 +1887,14 @@ async def get_batch_details(
         
         # Calculate summary statistics
         total_items = len(batch_stocks)
-        total_quantity = sum(stock.quantity for stock in batch_stocks)
+        
+        # FIXED: Calculate total product quantity from related products
+        total_product_quantity = Decimal('0.00')
+        for stock in batch_stocks:
+            product = db.query(Product).filter(Product.id == stock.product_id).first()
+            if product:
+                # Multiply product quantity by piece count
+                total_product_quantity += product.quantity * stock.piece
         
         # Count by category
         categories = {}
@@ -1904,8 +1918,6 @@ async def get_batch_details(
                 "id": stock.id,
                 "batch": stock.batch,
                 "piece": stock.piece,
-                "quantity": stock.quantity,
-                "unit": stock.unit,
                 "category": stock.category,
                 "archive": bool(stock.archive),
                 "product_id": stock.product_id,
@@ -1915,6 +1927,8 @@ async def get_batch_details(
                 "created_at": stock.created_at,
                 "updated_at": stock.updated_at,
                 "product_name": product.name if product else f"Product {stock.product_id} (Not Found)",
+                "product_unit": product.unit if product else None,      # ADDED: From Product table
+                "product_quantity": product.quantity if product else None,  # ADDED: From Product table
                 "supplier_name": supplier.name if supplier else f"Supplier {stock.supplier_id} (Not Found)",
                 "user_name": user_name
             }
@@ -1923,7 +1937,7 @@ async def get_batch_details(
         return BatchSummary(
             batch_number=batch_number,
             total_items=total_items,
-            total_quantity=total_quantity,
+            total_product_quantity=total_product_quantity,  # FIXED
             categories=categories,
             created_at=first_stock.created_at,
             user_name=user_name,
@@ -1951,6 +1965,7 @@ async def get_next_batch_number(
     except Exception as e:
         print(f"❌ Error getting next batch number: {e}")
         return {"next_batch_number": "batch-000001"}
+
 
 @app.post("/stocks/batch", response_model=BatchResponse, status_code=status.HTTP_201_CREATED)
 async def create_batch_stocks(
@@ -1992,13 +2007,7 @@ async def create_batch_stocks(
                     detail=f"Item {i+1}: Supplier not found (ID: {item.supplier_id})"
                 )
             
-            # Validate values
-            if item.quantity <= 0:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Item {i+1}: Quantity must be greater than 0"
-                )
-            
+            # FIXED: Only validate piece count (no quantity validation)
             if item.piece <= 0:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -2019,12 +2028,11 @@ async def create_batch_stocks(
             db_stock = Stock(
                 batch=batch_number,
                 piece=item.piece,
-                quantity=item.quantity,
-                unit=item.unit,
                 category=item.category,
                 product_id=item.product_id,
                 supplier_id=item.supplier_id,
                 users_id=users_id
+                # REMOVED: quantity and unit - now in Product table
             )
             db.add(db_stock)
             created_stocks.append(db_stock)
@@ -2048,8 +2056,6 @@ async def create_batch_stocks(
                 "id": stock.id,
                 "batch": stock.batch,
                 "piece": stock.piece,
-                "quantity": stock.quantity,
-                "unit": stock.unit,
                 "category": stock.category,
                 "archive": bool(stock.archive),
                 "product_id": stock.product_id,
@@ -2059,6 +2065,8 @@ async def create_batch_stocks(
                 "created_at": stock.created_at,
                 "updated_at": stock.updated_at,
                 "product_name": product.name if product else None,
+                "product_unit": product.unit if product else None,      # From Product table
+                "product_quantity": product.quantity if product else None,  # From Product table
                 "supplier_name": supplier.name if supplier else None,
                 "user_name": f"{user.first_name} {user.last_name}"
             }
@@ -2079,6 +2087,7 @@ async def create_batch_stocks(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error creating batch stocks"
         )
+
 
 @app.delete("/stocks/batches/{batch_number}")
 async def delete_batch(
